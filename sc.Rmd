@@ -1,0 +1,197 @@
+---
+title: "Untitled"
+author: "Gabriel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(SingleR)
+library(presto)
+library(harmony)
+```
+
+```{r}
+susztak.atlas <- 'NIHMS984561-supplement-T1.xlsx'
+abas <- setdiff(readxl::excel_sheets(susztak.atlas), 'Readme')
+
+atlas <- lapply(abas, function(aba) {
+  readxl::read_excel(susztak.atlas, sheet=aba) %>% 
+    dplyr::select(genes, `% diff`) %>% 
+    mutate(cel = aba)
+})
+
+atlas <- bind_rows(atlas)
+atlas$cel <- gsub("^[0-9]+\\.", "", atlas$cel)
+```
+
+#GSE146912
+```{r}
+# Função que adiciona um valor apenas nas entradas diferentes de zero
+noise <- function(df) {
+  df_modificado <- df
+  df_modificado[] <- lapply(df_modificado, function(coluna) {
+    if (is.numeric(coluna)) {
+      coluna <- sapply(coluna, function(x) {
+        if (x != 0) {
+          ruido <- sample(seq(-0.05 * x, 0.05 * x, by = .5), 1)
+          return(x + as.integer(round(ruido)))
+        } else {
+          return(x)
+        }
+      })
+    }
+    return(coluna)
+  })
+  return(df_modificado)
+}
+
+```
+
+
+```{r}
+#
+normal1 <- read.delim('Normal_1.txt')
+dox1 <- read.delim('Adriamycin_d10_1.txt')
+dox2 <- read.delim('Adriamycin_d10_2.txt')
+
+#criar pseudo-duplicata
+normal2 <- noise(normal1)
+
+#conferir se todos ENSEMBLID e genes estao nas amostras
+all(normal1$SYMBOL == dox1$SYMBOL)
+all(normal1$IGIS == dox2$IGIS)
+
+#Separar ENSEMBL e gene ids para um df especifico
+genes <- data.frame(n1.ensembl = normal1$IGIS) %>% 
+  mutate(
+         n1.genes = normal1$SYMBOL,
+         n2.ensembl = normal2$IGIS,
+         n2.genes = normal2$SYMBOL,
+         d1.ensembl = dox1$IGIS,
+         d1.genes = dox1$SYMBOL,
+         d2.ensembl = dox2$IGIS,
+         d2.genes = dox2$SYMBOL,)
+
+genes <- genes[!duplicated(genes$n1.genes),]
+all(genes$n1.genes == genes$d2.genes)
+
+normal1 <- normal1[!duplicated(normal1$SYMBOL),] 
+normal2 <- normal2[!duplicated(normal2$SYMBOL),]
+
+dox1 <- dox1[!duplicated(dox1$SYMBOL),] 
+dox2 <- dox2[!duplicated(dox2$SYMBOL),]
+
+
+rownames(normal1) <- normal1$SYMBOL
+rownames(normal2) <- normal2$SYMBOL
+rownames(dox1) <- dox1$SYMBOL
+rownames(dox2) <- dox2$SYMBOL
+
+
+normal1 <- normal1 %>% dplyr::select(-SYMBOL, -IGIS)
+normal2 <- normal2 %>% dplyr::select(-SYMBOL, -IGIS)
+dox1 <- dox1  %>% dplyr::select(-SYMBOL, -IGIS)
+dox2 <- dox2 %>% dplyr::select(-SYMBOL, -IGIS)
+
+
+s.n1 <- CreateSeuratObject(counts = normal1, min.cells = 3, min.features = 200, project = 'normal1')
+s.n2 <- CreateSeuratObject(counts = normal2, min.cells = 3,min.features = 200,project = 'normal2')
+s.d1 <- CreateSeuratObject(counts = dox1, min.cells = 3,min.features = 200,project = 'dox1')
+s.d2 <- CreateSeuratObject(counts = dox2, min.cells = 3,min.features = 200,project = 'dox2')
+
+
+sc <- merge(s.n1, c(s.n2, s.d1, s.d2))
+
+sc[["percent.mt"]] <- PercentageFeatureSet(sc, pattern = "^mt-")
+
+
+#Pre processing
+sc <- subset(sc, subset = nFeature_RNA > 200 & nFeature_RNA < 3000 & percent.mt <= 30)
+
+sc <- FindVariableFeatures(object = sc, selection.method = 'vst')
+sc <- NormalizeData(sc)
+sc <- ScaleData(sc, vars.to.regress = c('nCount_RNA', 'percent.mt'))
+
+
+
+sc <- RunPCA(sc, assay = 'RNA', npcs = 30, features = VariableFeatures(sc), verbose = T, ndims.print = 1:10, nfeatures.print = 10)
+ElbowPlot(sc) #com PCA calculado, definir o numero de dimensoes que serao utilizadas nas analises
+              #no elbow plot, selecionar onde aparece o 'cotovelo' no grafico. Aparentemente ocorreu entre 10-15
+VizDimLoadings(sc, dims = 1:10, reduction = "pca")
+DimHeatmap(sc, dims = 1:20, cells = 750, balanced = TRUE)
+
+
+#Harmony
+sc <- RunHarmony(sc, group.by.vars = 'orig.ident')
+sc <- RunUMAP(sc, reduction = 'harmony', dims=1:15)
+sc <- FindNeighbors(sc, reduction = 'harmony', dims = 1:15) %>% FindClusters(resolution = 0.5)
+sc <- RunTSNE(sc, reduction = 'harmony', dims=1:15)
+
+pdf('Figuras/UMAP.pdf', width = 5, height = 4)
+DimPlot(sc, reduction = 'umap', label = F, pt.size = .3, )
+dev.off()
+
+#DEG LIST
+sc <- JoinLayers(sc)
+sc.markers <- FindAllMarkers(sc, only.pos = F, logfc.threshold = 0.25, test.use = 'MAST', min.pct = 0.05)
+
+x <- sc.markers %>% filter(cluster == '4') %>% filter(avg_log2FC >= 0) %>% slice_head(., n = 100) %>% left_join(., atlas, by=c('gene' = 'genes')) 
+
+table(x$cel)
+Idents(sc) <- sc$seurat_clusters
+features <- c(
+              'Acta2', #myofibroblasto
+              'Vps37b', #NK
+              'Gata3', 'Flt1', 'Cd200',#endotelial glomerular/mesangial
+              'Cdh16', 'Apela', # cd pc
+              'Nphs2', 'Nphs1', #podocitos
+              'Fn1','Clec4a1',#fibro
+              'Hdc','Mmp9' #celulas imunes/granulocitos
+              )
+
+DotPlot(sc, features = features, cluster.idents = T, col.min = 0) + RotatedAxis()
+sc.markers %>% filter(cluster==12) %>% head(n=10)
+DimPlot(sc, reduction = 'tsne', label = T, pt.size = .5, label.size = 5)
+DimPlot(sc, reduction = 'umap', label = T, pt.size = .5, label.size = 5)
+
+sc$cell.type <- plyr::mapvalues(
+  x = sc$seurat_clusters,
+  from = c('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14'),
+  to = c('Endo1', 'Endo2', 'MC-like', 'Podo', 'Endo3', 'Endo4', 'Myofib', 'Endo5', 'Fibro', 'CD PC1', 'Neutro', 'CD PC2', 'Not.Def.', 'Endo6', 'NK'))
+Idents(sc) <- sc$cell.type
+
+pdf('Figuras/Podo.pdf', width = 5, height = 4)
+FeaturePlot(sc, features = c('Nphs1'), reduction = 'umap', pt.size = .5, label = T, label.size = 5, repel = T)
+dev.off()
+
+sc@meta.data$exp.cond <- plyr::mapvalues(
+  x = sc@meta.data$orig.ident,
+  from = c("normal1", "normal2", 'dox1', 'dox2'),
+  to = c("Control", "Control", 'Doxorrubicin', 'Doxorrubicin'))
+
+sc$cell.stim <- paste(sc$cell.type, sc$exp.cond, sep='_')
+Idents(sc) <- sc$cell.stim
+#podo.de <- FindMarkers(sc, ident.1 = '3_Doxorrubicin', ident.2 = '3_Control')
+
+#pseudo-bulk
+pseudo.sc <- AggregateExpression(sc, assays = 'RNA', return.seurat = T, group.by = c('exp.cond', 'orig.ident', 'cell.type'))
+
+pseudo.sc$cell.stim <- paste(pseudo.sc$cell.type, pseudo.sc$exp.cond, sep='_')
+Idents(pseudo.sc) <- pseudo.sc$cell.stim
+podo.pseudo.de <- FindMarkers(pseudo.sc, ident.1 = 'Podo_Doxorrubicin', ident.2 = 'Podo_Control', test.use='DESeq2', min.cells.group = 2)
+podo.pseudo.degs <- podo.pseudo.de %>% filter(p_val_adj <= 0.05)
+podo.pseudo.de %>% rownames_to_column(., 'genes') %>% as.data.frame() %>% writexl::write_xlsx('degs_podo.xlsx')
+
+
+mc.pseudo.de <- FindMarkers(pseudo.sc, ident.1 = 'MC-like_Doxorrubicin', ident.2 = 'MC-like_Control', test.use='DESeq2', min.cells.group = 2)
+mc.pseudo.degs <- mc.pseudo.de %>% filter(p_val_adj <= 0.05)
+mc.pseudo.de %>% rownames_to_column(., 'genes') %>% as.data.frame() %>% writexl::write_xlsx('degs_mc.xlsx')
+```
+
+####END HERE#####
